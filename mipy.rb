@@ -1,6 +1,7 @@
 #!/usr/bin/env ruby
 
 def usage msg=nil
+  STDERR.puts "*** #{msg}" if msg
   STDERR.puts "Usage:"
   STDERR.puts "mipy <name>"
   exit (msg ? 1 : 0)
@@ -10,6 +11,8 @@ def build_package
 end
 
 RPMDIR = "/tmp/osb/openSUSE_Tumbleweed/"
+SITELIB = "/usr/lib/python2.7/site-packages"
+SITEARCH = "/usr/lib64/python2.7/site-packages"
 
 class Spec
   private
@@ -17,8 +20,12 @@ class Spec
     result = {}
     nr = 0
     @spec.each do |line|
-      if line =~ what
-        result[$1] = nr
+      begin
+        if line =~ what
+          result[$1] = nr
+        end
+      rescue Exception => e
+        STDERR.puts "Can't match #{what.inspect} to\n#{line.inspect}\n\t#{e}"
       end
       nr += 1
     end
@@ -26,7 +33,7 @@ class Spec
   end
   public
 
-  attr_reader :spec
+  attr_reader :spec, :name, :file, :site_path
 
   def initialize name = nil
     unless name
@@ -37,15 +44,16 @@ class Spec
       end
     end
     names = name.split(".")
+    puts names.inspect
     @name = names[0]
-    if names[1] == "spec"
+    if names[-1] == "spec"
       @file = name
     else
       @file = "#{name}.spec"
     end
     @spec = []
     unless File.readable?(@file)
-      usage "No such .spec: #{name}"
+      usage "No such .spec: #{name} : #{@file.inspect}"
     end
     File.open @file do |f|
       f.each do |line|
@@ -54,6 +62,7 @@ class Spec
     end
   end
 
+  # extract content from RPM
   def content
     unless @content
       rpmname = nil
@@ -65,8 +74,15 @@ class Spec
         break
       end
       unless rpmname
-        STDERR.puts "Couldn't find .rpm for #{name}"
-        exit 1
+        if @built
+          STDERR.puts "Couldn't build .rpm for #{name}"
+          exit 1
+        else
+          puts "No .rpm found, building it ..."
+          @built = true
+          system "osb openSUSE_Tumbleweed"
+          return content
+        end
       end
       rpmpath = File.join(RPMDIR, rpmname)
       pipe = nil
@@ -79,6 +95,51 @@ class Spec
       pipe.close
     end
     @content
+  end
+
+  # find first Summary
+  #
+  def summary
+    unless @summary
+      spec.each do |l|
+        next unless l =~ /^Summary:(\s+)(.*)/
+        @summary = $2
+        break
+      end
+    end
+    @summary
+  end
+
+  # extract pathes with %python_sitelib / %python_sitearch
+  #  return max depth
+  def site_pathes_depth
+    unless @site_pathes_depth
+      @site_pathes_depth = 0
+      i = -1
+      content().each_line do |l|
+        i += 1
+        next unless l =~ %r{(#{SITELIB}|#{SITEARCH})/(.*)\.py}
+        @site_path_position ||= i
+        @site_path ||= $1
+        depth = $2.split("/").count
+        if depth > @site_pathes_depth
+          @site_pathes_depth = depth
+        end
+      end
+    end
+    @site_pathes_depth
+  end
+
+  # extract doc pathes from content
+  def docs
+    unless @docs
+      @docs = []
+      content().each_line do |l|
+        next unless l =~ %r{/usr/share/doc/packages}
+        @docs << l
+      end
+    end
+    @docs
   end
 
   def write
@@ -97,8 +158,12 @@ class Spec
     @files ||= find /^%files(.*)$/
   end
 
-  def sitelibs
-    @sitelibs ||= find /%{python_sitelib}/
+  def changelog_position
+    @changelog_position ||= find(/^%changelog/).first[1]
+  end
+
+  def prep_position
+    @prep_position ||= find(/^%prep/).first[1]
   end
 
 #packages.each do |k,v|
@@ -107,15 +172,11 @@ class Spec
 #files.each do |k,v|
 #  puts "File[#{k.inspect}] #{v.inspect}"
 #end
-#sitelibs.each do |k,v|
-#  puts "%{python_sitelib}[#{k.inspect}] #{v.inspect}"
-#end
-#
 
   # insert lines at position, return new position
-  def insert_at pos, lines
+  def insert_at pos, lines, prepend = nil
     lines.each do |l|
-      spec.insert pos, l
+      spec.insert pos, "#{prepend}#{l}"
       pos += 1
     end
     pos
@@ -127,28 +188,60 @@ name = ARGV.shift
 
 spec = Spec.new name
 
-puts spec.content
+puts "#{spec.name}: #{spec.spec.size} lines, #{spec.packages.size} %package, #{spec.files.size} %files"
 
-exit 0
+# computes spec.site_path and spec.size_path_position
+puts "#{spec.name}: max depth #{spec.site_pathes_depth} @ #{spec.site_path}, #{spec.docs.size} doc files"
 
-puts "#{name}: #{spec.spec.size} lines, #{spec.packages.size} %package, #{spec.files.size} %files, #{spec.sitelibs.size} %{python_sitelib}"
+# sitelib_pathes_depth returns the number of components
+#  after %{python_sitelib}/%python_sitearch
+#  the last component is the .py file itself
+#
+#          "%{python_sitelib}/*/*.py",
+#          "%{python_sitelib}/*/*/*.py",
+#          "%{python_sitelib}/*/*/*/*.py",
 
+site_macro = case spec.site_path
+        when SITELIB
+          "%{python_sitelib}"
+        when SITEARCH
+          "%{python_sitearch}"
+        else
+          STDERR.puts "%{python_sitelib}/%{python_sitearch} not found"
+        end
 
-# insert %files source
-#  after %files with %{python_sitelib}
+site_pathes = []
+for i in 2 .. spec.site_pathes_depth
+  site_pathes << (site_macro + ("/*" * i) + ".py")
+end
 
-_, sitelibs_position = spec.sitelibs.first
+# find the first site_macro in %files
 
-unless sitelibs_position
-  STDERR.puts "Couldn't find %python_sitelib position"
+_, pivot = spec.files.first
+
+site_macro_position = nil
+
+while pivot < spec.spec.size
+  if spec.spec[pivot] =~ /^#{site_macro}/
+    site_macro_position = pivot
+    break
+  end
+  pivot += 1
+end
+
+unless site_macro_position
+  STDERR.puts "Could not find #{site_macro} in %files"
   exit 1
 end
 
+# insert %files source
+#  after %files with %{python_sitelib/sitearch}
+
 # find the next %files after sitelibs_position
 
-pivot = nil
+pivot = spec.changelog_position # or use the %changelog entry
 spec.files.each do |k,v|
-  if v > sitelibs_position
+  if v > site_macro_position
     pivot = v
     break
   end
@@ -162,44 +255,40 @@ end
 # add %files source
 
 pivot = spec.insert_at pivot, [ "%files source",
-          "%defattr(-,root,root)",
-          "%{python_sitelib}/*/*.py",
-          "%{python_sitelib}/*/*/*.py",
-          "%{python_sitelib}/*/*/*/*.py",
-          ""
-          ]
+          "%defattr(-,root,root)"] + site_pathes + [""]
 
 # add %exclude
+  def site_path_position
+    unless @site_path_position
+      spec.each_line do |l|
+        next unless l =~ /^Summary:(\s+)(.*)/
+        @summary = $2
+        break
+      end
+    end
+    @summary
+  end
 
-spec.insert_at sitelibs_position, [ "%exclude %{python_sitelib}/*/*.py",
-  "%exclude %{python_sitelib}/*/*/*.py",
-  "%exclude %{python_sitelib}/*/*/*/*.py",
-  ]
+
+spec.insert_at site_macro_position, site_pathes, "%exclude "
 
 # insert %package source
 #  before first sub-package
 
-spec.insert_at pivot, [ "%files source",
-  "%defattr(-,root,root)",
-  "%{python_sitelib}/*/*.py",
-  "%{python_sitelib}/*/*/*.py",
-  "%{python_sitelib}/*/*/*/*.py",
-  ""
-  ]
+_, pivot = spec.packages.first
 
-# will raise without sub-packages
-
-_, pivot = packages.first
+pivot ||= spec.prep_position # use %prep if no %package found
 
 unless pivot
-  STDERR.puts "Couldn't find %package position"
+  STDERR.puts "Couldn't find %package position: #{spec.packages.inspect}"
+  exit 1
 end
 
 spec.insert_at pivot, [ "%package source",
-  "Summary:  source files",
+  "Summary:  Source files for #{spec.name}",
   "Group:    Development/Languages/Python",
   "%description source",
-  "Python source (.py) files",
+  "Python source (.py) files for #{spec.name} (#{spec.summary})",
   ""
   ]
   
